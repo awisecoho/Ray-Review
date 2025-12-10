@@ -1,0 +1,182 @@
+import os
+import time
+import zipfile
+from pathlib import Path
+from typing import List
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+from pypdf import PdfReader
+from PIL import Image
+import pytesseract
+
+from openai import OpenAI
+
+# ---------------------------
+# CONFIG YOU SHOULD EDIT
+# ---------------------------
+WATCH_FOLDER = r"C:\Users\awise\Downloads\LegacyInsight"
+OUTPUT_FOLDER = r"C:\Users\awise\Downloads\LegacyInsight\reports"
+MODEL = "gpt-4.1"
+
+# If Windows and Tesseract isn't on PATH, set this:
+TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(TESSERACT_EXE):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+
+RAY_REVIEW_INSTRUCTIONS = """
+You are Ray Review, a Legacy Claims compliance reviewer.
+Review the claim package text provided.
+Return:
+1) PASS or FAIL
+2) Fail reasons (if any) as bullet list
+3) Missing items
+4) Action items
+Follow NY DOI + general insurer estimate standards when state is NY.
+If state is unclear, say so and proceed with general best practice.
+Never invent regulations or VINs.
+"""
+
+client = OpenAI()
+
+def wait_until_file_stable(path: Path, timeout=180, interval=1.0) -> bool:
+    start = time.time()
+    last_size = -1
+    while time.time() - start < timeout:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            time.sleep(interval)
+            continue
+        if size == last_size and size > 0:
+            return True
+        last_size = size
+        time.sleep(interval)
+    return False
+
+def extract_pdf_text(pdf_path: Path, max_pages: int = 60) -> str:
+    reader = PdfReader(str(pdf_path))
+    text_parts = []
+    for page in reader.pages[:max_pages]:
+        try:
+            text_parts.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(text_parts).strip()
+
+def ocr_image_text(img_path: Path) -> str:
+    try:
+        img = Image.open(img_path)
+        text = pytesseract.image_to_string(img)
+        return text.strip()
+    except Exception as e:
+        return f"(OCR failed on {img_path.name}: {e})"
+
+def unzip_to_folder(zip_path: Path) -> Path:
+    out_dir = zip_path.with_suffix("")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(out_dir)
+    return out_dir
+
+def find_files(root: Path, exts: List[str]) -> List[Path]:
+    files = []
+    for ext in exts:
+        files.extend(root.rglob(f"*{ext}"))
+    return files
+
+def build_claim_text_from_folder(folder: Path) -> str:
+    pdfs = find_files(folder, [".pdf"])
+    imgs = find_files(folder, [".jpg", ".jpeg", ".png"])
+
+    parts = []
+    for pdf in pdfs:
+        parts.append(f"\n--- PDF: {pdf.name} ---\n")
+        parts.append(extract_pdf_text(pdf) or "(no text)")
+
+    for img in imgs:
+        parts.append(f"\n--- IMAGE OCR: {img.name} ---\n")
+        parts.append(ocr_image_text(img) or "(no ocr text)")
+
+    return "\n".join(parts).strip()
+
+def call_openai_review(file_name: str, combined_text: str) -> str:
+    prompt = f"""
+TOP-LEVEL FILE: {file_name}
+
+COMBINED CLAIM TEXT (PDF + OCR):
+{combined_text[:120000]}
+"""
+    resp = client.responses.create(
+        model=MODEL,
+        instructions=RAY_REVIEW_INSTRUCTIONS,
+        input=prompt
+    )
+    return resp.output_text
+
+def save_report(original_file: Path, review_text: str):
+    out_dir = Path(OUTPUT_FOLDER)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / f"{original_file.stem}_ray_review.txt"
+    report_path.write_text(review_text, encoding="utf-8")
+    print(f"[Ray Review] Report saved: {report_path}")
+
+def is_claim_file(path: Path) -> bool:
+    return path.suffix.lower() in [".pdf", ".zip", ".jpg", ".jpeg", ".png"]
+
+class ClaimFolderHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.is_directory:
+            return
+
+        path = Path(event.src_path)
+        if not is_claim_file(path):
+            return
+
+        print(f"[Watcher] New file detected: {path.name}")
+
+        if not wait_until_file_stable(path):
+            print(f"[Watcher] File never stabilized, skipping: {path.name}")
+            return
+
+        try:
+            if path.suffix.lower() == ".zip":
+                print(f"[Watcher] Unzipping: {path.name}")
+                extracted_dir = unzip_to_folder(path)
+                combined_text = build_claim_text_from_folder(extracted_dir)
+            elif path.suffix.lower() == ".pdf":
+                combined_text = extract_pdf_text(path)
+            else:
+                combined_text = ocr_image_text(path)
+
+            if not combined_text.strip():
+                combined_text = "(No extractable text found.)"
+
+            review = call_openai_review(path.name, combined_text)
+            save_report(path, review)
+
+        except Exception as e:
+            print(f"[Watcher] Error reviewing {path.name}: {e}")
+
+def main():
+    watch_path = Path(WATCH_FOLDER)
+    if not watch_path.exists():
+        raise RuntimeError(f"WATCH_FOLDER does not exist: {WATCH_FOLDER}")
+
+    print(f"[Ray Watcher] Watching folder: {WATCH_FOLDER}")
+    observer = Observer()
+    observer.schedule(ClaimFolderHandler(), WATCH_FOLDER, recursive=False)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("[Ray Watcher] Stopping...")
+        observer.stop()
+
+    observer.join()
+
+if __name__ == "__main__":
+    main()
